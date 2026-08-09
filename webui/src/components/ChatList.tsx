@@ -2,6 +2,7 @@ import {
   memo,
   useEffect,
   useMemo,
+  useRef,
   useState,
 } from "react";
 import {
@@ -23,7 +24,11 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
-import { deriveTitle, relativeTime } from "@/lib/format";
+import {
+  SIDEBAR_SELECTION_ITEM_CLASS,
+  SidebarSelectionHighlight,
+} from "@/components/SidebarSelectionHighlight";
+import { deriveTitle, relativeTime, visibleSessionPreview } from "@/lib/format";
 import {
   COLLAPSED_CHATS_VISIBLE_COUNT,
   displayTitle,
@@ -35,13 +40,13 @@ import {
   visibleSessionsForGroup,
   type ChatGroupLabels,
 } from "@/lib/chat-groups";
+import { clearDraggedSession, writeDraggedSession } from "@/lib/session-drag";
 import { cn } from "@/lib/utils";
 import type { ChatSummary, SidebarDensity, SidebarSortMode } from "@/lib/types";
 
 const INITIAL_VISIBLE_SESSIONS = 160;
 const VISIBLE_SESSIONS_INCREMENT = 160;
 const ACTION_MENU_CONTENT_CLASS = "w-[8.5rem] min-w-[8.5rem]";
-const ACTION_MENU_ITEM_CLASS = "grid w-[7.75rem] grid-cols-[1rem_minmax(0,1fr)] items-center gap-2";
 
 interface ChatListProps {
   sessions: ChatSummary[];
@@ -51,11 +56,13 @@ interface ChatListProps {
   onTogglePin: (key: string) => void;
   onRequestRename: (key: string, label: string) => void;
   onToggleArchive: (key: string) => void;
+  onReorderSessions?: (keys: string[]) => void;
   onToggleGroup?: (groupId: string) => void;
   onRequestRenameProject?: (projectKey: string, label: string) => void;
   onNewChatInProject?: (projectPath: string, projectName: string) => void;
   pinnedKeys?: string[];
   archivedKeys?: string[];
+  sessionOrder?: string[];
   titleOverrides?: Record<string, string>;
   projectNameOverrides?: Record<string, string>;
   collapsedGroups?: Record<string, boolean>;
@@ -80,11 +87,13 @@ export const ChatList = memo(function ChatList({
   onTogglePin,
   onRequestRename,
   onToggleArchive,
+  onReorderSessions,
   onToggleGroup,
   onRequestRenameProject,
   onNewChatInProject,
   pinnedKeys = [],
   archivedKeys = [],
+  sessionOrder = [],
   titleOverrides = {},
   projectNameOverrides = {},
   collapsedGroups = {},
@@ -102,6 +111,12 @@ export const ChatList = memo(function ChatList({
 }: ChatListProps) {
   const { t } = useTranslation();
   const [visibleLimit, setVisibleLimit] = useState(INITIAL_VISIBLE_SESSIONS);
+  const [draggedSessionKey, setDraggedSessionKey] = useState<string | null>(null);
+  const [sessionDropTarget, setSessionDropTarget] = useState<{
+    edge: "before" | "after";
+    key: string;
+  } | null>(null);
+  const activeRowRef = useRef<HTMLDivElement>(null);
   const labels = useMemo<ChatGroupLabels>(() => ({
     pinned: t("chat.groups.pinned"),
     all: t("chat.groups.all"),
@@ -118,6 +133,7 @@ export const ChatList = memo(function ChatList({
       archivedKeys,
       titleOverrides,
       projectNameOverrides,
+      sessionOrder,
       showArchived,
       sort,
       defaultWorkspacePath,
@@ -131,6 +147,7 @@ export const ChatList = memo(function ChatList({
       sort,
       titleOverrides,
       projectNameOverrides,
+      sessionOrder,
       defaultWorkspacePath,
     ],
   );
@@ -150,6 +167,21 @@ export const ChatList = memo(function ChatList({
     () => limitedGroups.reduce((total, group) => total + group.sessions.length, 0),
     [limitedGroups],
   );
+  const pinned = useMemo(() => new Set(pinnedKeys), [pinnedKeys]);
+  const archived = useMemo(() => new Set(archivedKeys), [archivedKeys]);
+  const sessionLanes = useMemo(() => {
+    const lanes = new Map<string, string>();
+    for (const group of groups) {
+      const scope = group.id.startsWith("date:") ? "timeline" : group.id;
+      for (const session of group.sessions) {
+        const status = pinned.has(session.key)
+          ? "pinned"
+          : archived.has(session.key) ? "archived" : "normal";
+        lanes.set(session.key, `${scope}:${status}`);
+      }
+    }
+    return lanes;
+  }, [archived, groups, pinned]);
   const hiddenSessionCount = Math.max(0, totalSessionCount - visibleSessionCount);
 
   useEffect(() => {
@@ -172,16 +204,39 @@ export const ChatList = memo(function ChatList({
     );
   }
 
-  const pinned = new Set(pinnedKeys);
-  const archived = new Set(archivedKeys);
   const running = new Set(runningChatIds);
   const updated = new Set(updatedChatIds);
   const compact = density === "compact";
   const firstProjectGroupIndex = limitedGroups.findIndex((group) => group.kind === "project");
 
+  const canReorderSession = (targetKey: string) => (
+    !!draggedSessionKey
+    && draggedSessionKey !== targetKey
+    && sessionLanes.get(draggedSessionKey) === sessionLanes.get(targetKey)
+  );
+  const reorderSession = (targetKey: string, edge: "before" | "after") => {
+    if (!draggedSessionKey || !canReorderSession(targetKey) || !onReorderSessions) return;
+    const keys = groups.flatMap((group) => group.sessions.map((session) => session.key));
+    const reordered = keys.filter((key) => key !== draggedSessionKey);
+    const targetIndex = reordered.indexOf(targetKey);
+    if (targetIndex < 0) return;
+    reordered.splice(targetIndex + (edge === "after" ? 1 : 0), 0, draggedSessionKey);
+    const groupedKeys = new Set(keys);
+    onReorderSessions([
+      ...reordered,
+      ...sessionOrder.filter((key) => !groupedKeys.has(key)),
+    ]);
+  };
+
   return (
     <div className="h-full min-h-0 min-w-0 overflow-x-hidden overflow-y-auto overscroll-contain scrollbar-thin scrollbar-track-transparent">
-      <div className="min-w-0 space-y-3 px-2 py-1.5">
+      <SidebarSelectionHighlight
+        targetRef={activeRowRef}
+        activeId={activeKey}
+        scope="sessions"
+        data-chat-list-content
+        className="relative min-w-0 space-y-3 px-2 py-1.5"
+      >
         {limitedGroups.map((group, index) => {
           const foldableChatsGroup = isFoldableChatsGroup(group);
           const foldedChatsGroup = isFoldedChatsGroup(group, collapsedGroups);
@@ -194,7 +249,7 @@ export const ChatList = memo(function ChatList({
           const canToggleFold = group.sessions.length > COLLAPSED_CHATS_VISIBLE_COUNT;
 
           return (
-            <section key={group.id} aria-label={group.label}>
+            <section key={group.id} aria-label={group.label} className="relative z-[1]">
               {index === firstProjectGroupIndex ? (
                 <div className="px-2 pb-1 text-[12px] font-medium text-muted-foreground/65">
                   {labels.projects}
@@ -237,7 +292,7 @@ export const ChatList = memo(function ChatList({
                       deriveTitle(s.preview, fallbackTitle);
                     const isPinned = pinned.has(s.key);
                     const isArchived = archived.has(s.key);
-                    const preview = s.preview.trim();
+                    const preview = visibleSessionPreview(s.preview);
                     const showPreview = showPreviews && preview && preview !== title;
                     const timestamp = showTimestamps
                       ? relativeTime(s.updatedAt ?? s.createdAt)
@@ -249,22 +304,72 @@ export const ChatList = memo(function ChatList({
                         ? "updated"
                         : null;
                     return (
-                      <li key={s.key} className="min-w-0">
+                      <li
+                        key={s.key}
+                        className="relative min-w-0"
+                        onDragOver={(event) => {
+                          if (!canReorderSession(s.key)) return;
+                          event.preventDefault();
+                          event.dataTransfer.dropEffect = "move";
+                          const rect = event.currentTarget.getBoundingClientRect();
+                          setSessionDropTarget({
+                            key: s.key,
+                            edge: event.clientY < rect.top + rect.height / 2 ? "before" : "after",
+                          });
+                        }}
+                        onDrop={(event) => {
+                          if (!canReorderSession(s.key)) return;
+                          event.preventDefault();
+                          const rect = event.currentTarget.getBoundingClientRect();
+                          const edge = event.clientY < rect.top + rect.height / 2
+                            ? "before"
+                            : "after";
+                          reorderSession(s.key, edge);
+                          setDraggedSessionKey(null);
+                          setSessionDropTarget(null);
+                        }}
+                      >
+                        {sessionDropTarget?.key === s.key ? (
+                          <span
+                            aria-hidden
+                            data-session-drop-edge={sessionDropTarget.edge}
+                            className={cn(
+                              "pointer-events-none absolute inset-x-2 z-20 h-0.5 rounded-full bg-primary",
+                              sessionDropTarget.edge === "before" ? "-top-px" : "-bottom-px",
+                            )}
+                          />
+                        ) : null}
                         <div
+                          ref={active ? activeRowRef : undefined}
+                          data-chat-row={s.key}
                           className={cn(
-                            "group flex min-w-0 max-w-full items-center gap-2 rounded-xl px-2 text-[13px] transition-colors",
+                            "group flex min-w-0 max-w-full items-center gap-2 rounded-xl px-2 text-[13px]",
+                            SIDEBAR_SELECTION_ITEM_CLASS,
                             compact ? "min-h-7" : "min-h-8",
                             active
-                              ? "bg-sidebar-accent/70 text-sidebar-accent-foreground shadow-[inset_0_0_0_1px_hsl(var(--sidebar-border)/0.28)]"
-                              : "text-sidebar-foreground/82 hover:bg-sidebar-accent/50 hover:text-sidebar-foreground",
+                              ? "text-sidebar-accent-foreground"
+                              : "text-sidebar-foreground/82 hover:bg-sidebar-foreground/[0.035] hover:text-sidebar-foreground dark:hover:bg-white/[0.05]",
                           )}
                         >
                           <button
                             type="button"
                             onClick={() => onSelect(s.key)}
+                            draggable
+                            onDragStart={(event) => {
+                              setDraggedSessionKey(s.key);
+                              setSessionDropTarget(null);
+                              writeDraggedSession(event.dataTransfer, s.key);
+                            }}
+                            onDragEnd={() => {
+                              clearDraggedSession();
+                              setDraggedSessionKey(null);
+                              setSessionDropTarget(null);
+                            }}
+                            aria-current={active ? "page" : undefined}
                             title={tooltipTitle}
                             className={cn(
                               "min-w-0 flex-1 overflow-hidden text-left",
+                              "cursor-grab active:cursor-grabbing",
                               compact ? "py-1" : "py-1.5",
                               projectMode && "pl-7",
                             )}
@@ -274,6 +379,7 @@ export const ChatList = memo(function ChatList({
                                 <span className="min-w-0 flex-1 truncate font-medium leading-5">
                                   {title}
                                 </span>
+                                {isPinned ? <PinnedChatIndicator label={labels.pinned} /> : null}
                                 {timestamp ? (
                                   <span className="shrink-0 text-[11.5px] font-medium text-muted-foreground/58">
                                     {timestamp}
@@ -281,8 +387,11 @@ export const ChatList = memo(function ChatList({
                                 ) : null}
                               </span>
                             ) : (
-                              <span className="block w-full truncate font-medium leading-5">
-                                {title}
+                              <span className="flex w-full min-w-0 items-center gap-1.5">
+                                <span className="min-w-0 flex-1 truncate font-medium leading-5">
+                                  {title}
+                                </span>
+                                {isPinned ? <PinnedChatIndicator label={labels.pinned} /> : null}
                               </span>
                             )}
                             {showPreview ? (
@@ -317,7 +426,6 @@ export const ChatList = memo(function ChatList({
                             >
                               <DropdownMenuItem
                                 onSelect={() => onTogglePin(s.key)}
-                                className={ACTION_MENU_ITEM_CLASS}
                               >
                                 {isPinned ? (
                                   <PinOff className="h-4 w-4 shrink-0" />
@@ -328,14 +436,12 @@ export const ChatList = memo(function ChatList({
                               </DropdownMenuItem>
                               <DropdownMenuItem
                                 onSelect={() => onRequestRename(s.key, title)}
-                                className={ACTION_MENU_ITEM_CLASS}
                               >
                                 <Pencil className="h-4 w-4 shrink-0" />
                                 {t("chat.rename")}
                               </DropdownMenuItem>
                               <DropdownMenuItem
                                 onSelect={() => onToggleArchive(s.key)}
-                                className={ACTION_MENU_ITEM_CLASS}
                               >
                                 {isArchived ? (
                                   <ArchiveRestore className="h-4 w-4 shrink-0" />
@@ -345,13 +451,10 @@ export const ChatList = memo(function ChatList({
                                 {isArchived ? t("chat.unarchive") : t("chat.archive")}
                               </DropdownMenuItem>
                               <DropdownMenuItem
+                                tone="destructive"
                                 onSelect={() => {
                                   window.setTimeout(() => onRequestDelete(s.key, title), 0);
                                 }}
-                                className={cn(
-                                  ACTION_MENU_ITEM_CLASS,
-                                  "text-destructive focus:text-destructive",
-                                )}
                               >
                                 <Trash2 className="h-4 w-4 shrink-0" />
                                 {t("chat.delete")}
@@ -375,7 +478,7 @@ export const ChatList = memo(function ChatList({
           );
         })}
         {hiddenSessionCount > 0 ? (
-          <div className="px-2 pb-2 pt-1">
+          <div className="relative z-[1] px-2 pb-2 pt-1">
             <button
               type="button"
               onClick={() =>
@@ -389,7 +492,7 @@ export const ChatList = memo(function ChatList({
             </button>
           </div>
         ) : null}
-      </div>
+      </SidebarSelectionHighlight>
     </div>
   );
 });
@@ -452,7 +555,7 @@ function ProjectGroupHeader({
             portalContainer={actionMenuPortalContainer}
             onCloseAutoFocus={(event) => event.preventDefault()}
           >
-            <DropdownMenuItem onSelect={onRequestRename} className={ACTION_MENU_ITEM_CLASS}>
+            <DropdownMenuItem onSelect={onRequestRename}>
               <Pencil className="h-4 w-4 shrink-0" />
               {t("chat.rename")}
             </DropdownMenuItem>
@@ -488,6 +591,18 @@ function ChatsGroupHeader({ label }: { label: string }) {
   );
 }
 
+function PinnedChatIndicator({ label }: { label: string }) {
+  return (
+    <span
+      aria-hidden="true"
+      title={label}
+      className="inline-flex shrink-0 items-center text-muted-foreground/65"
+    >
+      <Pin className="h-3.5 w-3.5" aria-hidden="true" />
+    </span>
+  );
+}
+
 function ChatsFoldFooter({
   folded,
   hiddenCount,
@@ -500,7 +615,7 @@ function ChatsFoldFooter({
   const { t, i18n } = useTranslation();
   const collapsedFallback = i18n.resolvedLanguage?.startsWith("zh")
     ? `已折叠 ${hiddenCount} 个对话`
-    : `${hiddenCount} hidden chats`;
+    : `${hiddenCount} hidden topics`;
 
   return (
     <div className="px-2 pb-1 pt-1">

@@ -100,5 +100,9 @@ temp/
 exp/
 .playwright-mcp/
 bridge/node_modules/
+<<<<<<< HEAD
 
 .codegraph
+=======
+webui/.verify-*
+>>>>>>> 8dfce4c162c8483fd59ccfbb96c1b0e0af10c751

@@ -1,4 +1,5 @@
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import i18n from "@/i18n";
@@ -12,6 +13,7 @@ const getSessionAutomationsSpy = vi.fn<(key: string) => Promise<SessionAutomatio
 const toggleThemeSpy = vi.fn();
 const updateUrlSpy = vi.fn();
 const attachSpy = vi.fn();
+const setSidebarStateSpy = vi.fn();
 const runStatusHandlers = new Set<(chatId: string, startedAt: number | null) => void>();
 const sessionUpdateHandlers = new Set<(chatId: string, scope?: string) => void>();
 let mockSessions: ChatSummary[] = [];
@@ -37,7 +39,11 @@ function mockFetchRoutes(routes: Record<string, unknown>): void {
   vi.stubGlobal(
     "fetch",
     vi.fn(async (input: RequestInfo | URL) => {
-      const body = routes[String(input)];
+      const route = routes[String(input)];
+      const body =
+        typeof route === "function"
+          ? await (route as () => unknown | Promise<unknown>)()
+          : route;
       return body === undefined
         ? ({ ok: false, status: 404, json: async () => ({}) } as Response)
         : jsonResponse(body);
@@ -58,8 +64,6 @@ function baseSettingsPayload() {
       temperature: 0.1,
       reasoning_effort: null,
       timezone: "UTC",
-      bot_name: "nanobot",
-      bot_icon: "nb",
       tool_hint_max_length: 40,
     },
     model_presets: [{
@@ -74,6 +78,8 @@ function baseSettingsPayload() {
       temperature: 0.1,
       reasoning_effort: null,
     }],
+    model_call_order: [],
+    model_call_order_editable: false,
     providers: [],
     web_search: {
       provider: "duckduckgo",
@@ -113,9 +119,6 @@ function baseSettingsPayload() {
       },
       dream: {
         schedule: "every 2h",
-        max_batch_size: 20,
-        max_iterations: 15,
-        annotate_line_ages: true,
       },
       unified_session: false,
     },
@@ -175,12 +178,20 @@ vi.mock("@/hooks/useTheme", async () => {
 });
 
 vi.mock("@/lib/bootstrap", () => ({
+  BootstrapAuthRequiredError: class BootstrapAuthRequiredError extends Error {
+    constructor(message = "bootstrap authentication required") {
+      super(message);
+      this.name = "BootstrapAuthRequiredError";
+    }
+  },
   fetchBootstrap: vi.fn().mockResolvedValue({
     token: "tok",
+    api_token: "api-tok",
     ws_path: "/",
     expires_in: 300,
   }),
   deriveWsUrl: vi.fn(() => "ws://test"),
+  consumeUrlBootstrapSecret: vi.fn(() => ""),
   loadSavedSecret: vi.fn(() => ""),
   saveSecret: vi.fn(),
   clearSavedSecret: vi.fn(),
@@ -208,14 +219,20 @@ vi.mock("@/lib/nanobot-client", () => {
     sendMessage = vi.fn();
     newChat = vi.fn();
     attach = attachSpy;
+    setSidebarState = setSidebarStateSpy;
     close = vi.fn();
     updateUrl = updateUrlSpy;
+    updateMaxFrameBytes = vi.fn();
   }
 
   return { NanobotClient: MockClient };
 });
 
-import { deriveWsUrl, fetchBootstrap } from "@/lib/bootstrap";
+import {
+  BootstrapAuthRequiredError,
+  deriveWsUrl,
+  fetchBootstrap,
+} from "@/lib/bootstrap";
 import App from "@/App";
 
 describe("App layout", () => {
@@ -230,6 +247,7 @@ describe("App layout", () => {
     getSessionAutomationsSpy.mockReset().mockResolvedValue([]);
     toggleThemeSpy.mockReset();
     attachSpy.mockReset();
+    setSidebarStateSpy.mockReset();
     runStatusHandlers.clear();
     sessionUpdateHandlers.clear();
     window.history.replaceState(null, "", "/");
@@ -237,8 +255,11 @@ describe("App layout", () => {
     localStorage.removeItem("nanobot-webui.sidebar");
     localStorage.removeItem("nanobot-webui.sidebar.completed-runs.v1");
     localStorage.removeItem("nanobot-webui.sidebar.session-updates.v1");
+    localStorage.removeItem("nanobot-webui.restartStartedAt");
+    localStorage.removeItem("nanobot-webui.restartRoute");
     vi.mocked(fetchBootstrap).mockReset().mockResolvedValue({
       token: "tok",
+      api_token: "api-tok",
       ws_path: "/",
       expires_in: 300,
     });
@@ -259,6 +280,20 @@ describe("App layout", () => {
   it("shows the auth form without an invalid-password error on first load", async () => {
     vi.mocked(fetchBootstrap).mockRejectedValueOnce(
       new Error("bootstrap failed: HTTP 401"),
+    );
+
+    render(<App />);
+
+    expect(await screen.findByText("Authentication required")).toBeInTheDocument();
+    expect(screen.queryByText("Invalid password. Try again.")).not.toBeInTheDocument();
+    expect(connectSpy).not.toHaveBeenCalled();
+  });
+
+  it("shows the auth form when bootstrap does not issue an API token", async () => {
+    vi.mocked(fetchBootstrap).mockRejectedValueOnce(
+      new BootstrapAuthRequiredError(
+        "bootstrap authentication required: missing api_token",
+      ),
     );
 
     render(<App />);
@@ -316,27 +351,100 @@ describe("App layout", () => {
     ).toBeTruthy();
   });
 
+  it("highlights the blank new-topic destination immediately", async () => {
+    render(<App />);
+
+    await waitFor(() => expect(connectSpy).toHaveBeenCalled());
+    const sidebar = screen.getByRole("navigation", { name: "Sidebar navigation" });
+    const newTopicButton = within(sidebar).getByRole("button", { name: "New topic" });
+
+    expect(newTopicButton).toHaveAttribute("aria-current", "page");
+    expect(newTopicButton).not.toHaveClass("bg-sidebar-accent");
+    expect(newTopicButton).toHaveClass("transition-[width,padding,color]");
+    expect(within(sidebar).getByTestId("actions-selection-highlight")).toHaveAttribute(
+      "data-active-id",
+      "new-chat",
+    );
+  });
+
+  it("restores the Settings route after a restart fallback hash", async () => {
+    localStorage.setItem("nanobot-webui.restartStartedAt", String(Date.now()));
+    localStorage.setItem("nanobot-webui.restartRoute", "#/settings?section=channels");
+    window.history.replaceState(null, "", "/#/new");
+    mockFetchRoutes({
+      "/api/settings": baseSettingsPayload(),
+      "/api/settings/nanobot-features": {
+        features: [{
+          name: "websocket",
+          display_name: "Websocket",
+          type: "channel",
+          enabled: true,
+          installed: true,
+          ready: true,
+          status: "enabled",
+          install_supported: true,
+          requires_restart: true,
+        }],
+        enabled_count: 1,
+      },
+    });
+
+    render(<App />);
+
+    await waitFor(() => expect(connectSpy).toHaveBeenCalled());
+    expect(
+      await screen.findByRole("navigation", { name: "Settings sections" }),
+    ).toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "Channels" })).not.toBeInTheDocument();
+    expect(window.location.hash).toBe("#/settings?section=channels");
+  });
+
   it("opens Skills from the main sidebar", async () => {
+    const longSkillDescription = [
+      "Work with GitHub repositories, issues, pull requests, releases, workflows,",
+      "and code search through the GitHub CLI.",
+      "Use this skill for repository maintenance, review automation, release preparation,",
+      "and other GitHub workflows that need authenticated command-line access.",
+    ].join(" ");
     mockFetchRoutes({
       "/api/settings": baseSettingsPayload(),
       "/api/settings/cli-apps": { apps: [], installed_count: 0, catalog_updated_at: "2026-04-18" },
       "/api/settings/mcp-presets": { presets: [], installed_count: 0 },
       "/api/webui/skills": {
         skills: [
-          { name: "cron", description: "Schedule reminders.", source: "builtin", available: true },
+          {
+            name: "cron",
+            description: "Schedule reminders.",
+            source: "builtin",
+            enabled: true,
+            deletable: false,
+            available: true,
+          },
           {
             name: "github",
             description: "Work with GitHub.",
             source: "builtin",
+            enabled: true,
+            deletable: false,
             available: false,
             unavailable_reason: "CLI: gh",
+          },
+          {
+            name: "custom-skill",
+            description: "A workspace skill.",
+            source: "workspace",
+            enabled: true,
+            deletable: true,
+            available: true,
           },
         ],
       },
       "/api/webui/skills/github": {
         name: "github",
-        description: "Work with GitHub.",
+        description: longSkillDescription,
         source: "builtin",
+        enabled: true,
+        deletable: false,
         available: false,
         unavailable_reason: "CLI: gh",
         requirements: {
@@ -345,7 +453,47 @@ describe("App layout", () => {
           missing_bins: ["gh"],
           missing_env: [],
         },
+        install_options: [{
+          id: "brew",
+          kind: "brew",
+          label: "Install GitHub CLI (brew)",
+          command: "brew install gh",
+        }],
         raw_markdown: "---\nname: github\n---\nUse GitHub CLI.",
+      },
+      "/api/webui/skills/update?name=github&enabled=false": {
+        skills: [
+          {
+            name: "cron",
+            description: "Schedule reminders.",
+            source: "builtin",
+            enabled: true,
+            deletable: false,
+            available: true,
+          },
+          {
+            name: "github",
+            description: "Work with GitHub.",
+            source: "builtin",
+            enabled: false,
+            deletable: false,
+            available: false,
+            unavailable_reason: "CLI: gh",
+          },
+          {
+            name: "custom-skill",
+            description: "A workspace skill.",
+            source: "workspace",
+            enabled: true,
+            deletable: true,
+            available: true,
+          },
+        ],
+        last_action: {
+          name: "github",
+          enabled: false,
+          deleted: false,
+        },
       },
     });
 
@@ -358,9 +506,15 @@ describe("App layout", () => {
     fireEvent.click(skillsButton);
 
     expect(await screen.findByRole("heading", { name: "Skills" })).toBeInTheDocument();
+    expect(screen.getByRole("textbox", { name: "Search installed skills" })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Custom" })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Built-in" })).toBeInTheDocument();
     expect(screen.getByText("cron")).toBeInTheDocument();
     expect(screen.getByText("github")).toBeInTheDocument();
-    expect(screen.getByText("Missing: CLI: gh")).toBeInTheDocument();
+    expect(screen.getByText("Needs setup")).toBeInTheDocument();
+    expect(
+      screen.queryByText("Review the instruction skills this agent can load during a conversation."),
+    ).not.toBeInTheDocument();
     expect(screen.getByRole("navigation", { name: "Sidebar navigation" })).toBeInTheDocument();
     expect(screen.queryByRole("navigation", { name: "Settings sections" })).not.toBeInTheDocument();
     expect(within(sidebar).getByRole("button", { name: "Skills" })).toHaveAttribute(
@@ -378,11 +532,280 @@ describe("App layout", () => {
     fireEvent.click(screen.getByRole("button", { name: "Open details for github" }));
 
     expect(await screen.findByRole("heading", { name: "github" })).toBeInTheDocument();
-    expect(screen.getByText("Unavailable reason")).toBeInTheDocument();
-    expect(screen.getAllByText("CLI: gh").length).toBeGreaterThan(0);
-    expect(screen.getByText("Missing CLI")).toBeInTheDocument();
-    fireEvent.click(screen.getByText("Raw SKILL.md"));
+    const showMore = await screen.findByRole("button", { name: "Show more" });
+    expect(showMore).toHaveAttribute("aria-expanded", "false");
+    fireEvent.click(showMore);
+    expect(screen.getByRole("button", { name: "Show less" })).toHaveAttribute(
+      "aria-expanded",
+      "true",
+    );
+    expect(screen.getByText("Setup required")).toBeInTheDocument();
+    expect(
+      screen.queryByText(
+        "Allow the agent to load this skill when its requirements are ready.",
+      ),
+    ).not.toBeInTheDocument();
+    expect(screen.getByText("brew install gh")).toBeInTheDocument();
+    expect(screen.queryByText("Unavailable reason")).not.toBeInTheDocument();
+    expect(screen.queryByText("Missing CLI")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Check again" })).toBeInTheDocument();
+    fireEvent.click(screen.getByText("Skill instructions"));
     expect(screen.getByText(/Use GitHub CLI/)).toBeInTheDocument();
+    const enabledSwitch = screen.getByRole("switch", { name: "Disable github" });
+    expect(enabledSwitch).toHaveAttribute("aria-checked", "true");
+    fireEvent.click(enabledSwitch);
+    await waitFor(() => {
+      expect(screen.getByRole("switch", { name: "Enable github" })).toHaveAttribute(
+        "aria-checked",
+        "false",
+      );
+    });
+  });
+
+  it("deletes a custom skill from its detail sheet", async () => {
+    mockFetchRoutes({
+      "/api/settings": baseSettingsPayload(),
+      "/api/settings/cli-apps": { apps: [], installed_count: 0, catalog_updated_at: "2026-04-18" },
+      "/api/settings/mcp-presets": { presets: [], installed_count: 0 },
+      "/api/webui/skills": {
+        skills: [
+          {
+            name: "custom-skill",
+            description: "A workspace skill.",
+            source: "workspace",
+            enabled: true,
+            deletable: true,
+            available: true,
+          },
+        ],
+      },
+      "/api/webui/skills/custom-skill": {
+        name: "custom-skill",
+        description: "A workspace skill.",
+        source: "workspace",
+        enabled: true,
+        deletable: true,
+        available: true,
+        requirements: {
+          bins: [],
+          env: [],
+          missing_bins: [],
+          missing_env: [],
+        },
+        raw_markdown: "---\nname: custom-skill\n---\nWorkspace instructions.",
+      },
+      "/api/webui/skills/delete?name=custom-skill": {
+        skills: [],
+        last_action: {
+          name: "custom-skill",
+          enabled: false,
+          deleted: true,
+        },
+      },
+    });
+
+    render(<App />);
+
+    await waitFor(() => expect(connectSpy).toHaveBeenCalled());
+    const sidebar = screen.getByRole("navigation", { name: "Sidebar navigation" });
+    fireEvent.click(within(sidebar).getByRole("button", { name: "Skills" }));
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Open details for custom-skill" }),
+    );
+    expect(await screen.findByRole("heading", { name: "custom-skill" })).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Delete" }));
+    expect(screen.getByRole("heading", { name: "Delete custom-skill?" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Delete skill" }));
+
+    await waitFor(() => {
+      expect(
+        screen.queryByRole("button", { name: "Open details for custom-skill" }),
+      ).not.toBeInTheDocument();
+    });
+    expect(screen.getByText("No matching skills.")).toBeInTheDocument();
+  });
+
+  it("discovers and installs a skill from skills.sh", async () => {
+    let finishInstall!: (value: unknown) => void;
+    const pendingInstall = new Promise<unknown>((resolve) => {
+      finishInstall = resolve;
+    });
+    const installedPayload = {
+      skills: [
+        {
+          name: "react-testing",
+          description: "Test React apps.",
+          source: "workspace",
+          available: true,
+        },
+        { name: "cron", description: "Schedule reminders.", source: "builtin", available: true },
+      ],
+      last_action: {
+        installed: true,
+        already_installed: false,
+        name: "react-testing",
+      },
+    };
+    mockFetchRoutes({
+      "/api/settings": baseSettingsPayload(),
+      "/api/settings/cli-apps": { apps: [], installed_count: 0, catalog_updated_at: "2026-04-18" },
+      "/api/settings/mcp-presets": { presets: [], installed_count: 0 },
+      "/api/webui/skills": {
+        skills: [
+          { name: "cron", description: "Schedule reminders.", source: "builtin", available: true },
+        ],
+      },
+      "/api/webui/skills/trending?provider=all": {
+        period: "mixed",
+        provider: "all",
+        install_supported: true,
+        skills: [
+          {
+            id: "vercel-labs/skills/find-skills",
+            skill_id: "find-skills",
+            name: "find-skills",
+            source: "vercel-labs/skills",
+            provider: "skills_sh",
+            installs: 14_481,
+            url: "https://skills.sh/vercel-labs/skills/find-skills",
+            installed: false,
+            install_supported: true,
+            metric: "installs_24h",
+            rank: 18,
+          },
+          {
+            id: "skillhub:ima-skills",
+            skill_id: "ima-skills",
+            name: "ima-skills",
+            source: "@tencent-adm/ima-skills",
+            provider: "skillhub",
+            installs: 11_831,
+            downloads: 142_525,
+            url: "https://skillhub.cn/tencent-adm/ima-skills",
+            installed: false,
+            install_supported: true,
+            metric: "installs_total",
+            version: "1.1.8",
+            verified: true,
+            rank: 1,
+          },
+        ],
+      },
+      "/api/webui/skills/trends?id=vercel-labs%2Fskills%2Ffind-skills": {
+        trends: {
+          "vercel-labs/skills/find-skills": [20, 32, 28, 45, 41, 50, 62, 58],
+        },
+      },
+      "/api/webui/skills/search?q=React&provider=all": {
+        query: "React",
+        provider: "all",
+        install_supported: true,
+        skills: [
+          {
+            id: "acme/agent-skills/react-testing",
+            skill_id: "react-testing",
+            name: "React Testing",
+            source: "acme/agent-skills",
+            provider: "skills_sh",
+            installs: 42,
+            url: "https://skills.sh/acme/agent-skills/react-testing",
+            installed: false,
+            install_supported: true,
+            metric: "installs_total",
+          },
+          {
+            id: "skillhub:react",
+            skill_id: "react",
+            name: "React",
+            source: "@ivangdavila/react",
+            provider: "skillhub",
+            installs: 693,
+            downloads: 7_718,
+            url: "https://skillhub.cn/ivangdavila/react",
+            installed: false,
+            install_supported: true,
+            metric: "installs_total",
+            version: "1.0.4",
+          },
+        ],
+      },
+      "/api/webui/skills/trends?id=acme%2Fagent-skills%2Freact-testing": {
+        trends: { "acme/agent-skills/react-testing": [] },
+      },
+      "/api/webui/skills/install?provider=skills_sh&source=acme%2Fagent-skills&skill=react-testing":
+        () => pendingInstall,
+    });
+
+    render(<App />);
+
+    await waitFor(() => expect(connectSpy).toHaveBeenCalled());
+    const sidebar = screen.getByRole("navigation", { name: "Sidebar navigation" });
+    fireEvent.click(within(sidebar).getByRole("button", { name: "Skills" }));
+    const discoverTab = await screen.findByRole("tab", { name: "Discover" });
+    expect(discoverTab.querySelector("svg")).toBeNull();
+    fireEvent.click(discoverTab);
+    expect(
+      await screen.findByRole("heading", { name: "Trending by marketplace" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByText("Each marketplace keeps its own ranking and install metrics."),
+    ).not.toBeInTheDocument();
+    expect(screen.getByText("find-skills")).toBeInTheDocument();
+    expect(screen.getByText("ima-skills")).toBeInTheDocument();
+    expect(screen.getAllByText("SkillHub")).toHaveLength(2);
+    expect(screen.getAllByText("skills.sh")).toHaveLength(2);
+    expect(screen.getByText(/14,481 installs \/ 24h/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("tab", { name: "SkillHub" }));
+    expect(screen.getByText("ima-skills")).toBeInTheDocument();
+    expect(screen.queryByText("find-skills")).not.toBeInTheDocument();
+    expect(
+      vi.mocked(fetch).mock.calls.some(
+        ([input]) =>
+          String(input) === "/api/webui/skills/trending?provider=skillhub",
+      ),
+    ).toBe(false);
+    fireEvent.click(screen.getByRole("tab", { name: "All" }));
+    expect(screen.getByText("find-skills")).toBeInTheDocument();
+    expect(screen.getByText("ima-skills")).toBeInTheDocument();
+    expect(
+      await screen.findByRole("img", { name: "8-week install trend" }),
+    ).toBeInTheDocument();
+    fireEvent.change(screen.getByRole("textbox", { name: "Search skills" }), {
+      target: { value: "React" },
+    });
+
+    expect(await screen.findByText("React Testing")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Install React Testing" }));
+    expect(
+      await screen.findByRole("heading", { name: "Install React Testing?" }),
+    ).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Install skill" }));
+
+    await waitFor(() => {
+      expect(fetch).toHaveBeenCalledWith(
+        "/api/webui/skills/install?provider=skills_sh&source=acme%2Fagent-skills&skill=react-testing",
+        expect.objectContaining({
+          headers: { Authorization: expect.any(String) },
+        }),
+      );
+    });
+    fireEvent.click(screen.getByRole("tab", { name: "Installed" }));
+    fireEvent.click(screen.getByRole("tab", { name: "Discover" }));
+    expect(
+      await screen.findByRole("button", { name: "Install find-skills" }),
+    ).toBeDisabled();
+
+    await act(async () => {
+      finishInstall(installedPayload);
+      await pendingInstall;
+    });
+
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: "Install find-skills" })).toBeEnabled();
+    });
+    fireEvent.click(screen.getByRole("tab", { name: "Installed" }));
+    expect(screen.getByText("react-testing")).toBeInTheDocument();
   });
 
   it("opens Automations from the main sidebar", async () => {
@@ -723,6 +1146,7 @@ describe("App layout", () => {
     ];
     vi.mocked(fetchBootstrap).mockResolvedValue({
       token: "tok",
+      api_token: "api-tok",
       ws_path: "/",
       expires_in: 300,
       runtime_surface: "native",
@@ -794,13 +1218,13 @@ describe("App layout", () => {
       ).toBeInTheDocument(),
     );
 
-    fireEvent.pointerDown(screen.getByLabelText("Chat actions for First chat"), {
+    fireEvent.pointerDown(screen.getByLabelText("Topic actions for First chat"), {
       button: 0,
     });
     fireEvent.click(await screen.findByRole("menuitem", { name: "Delete" }));
 
     await waitFor(() =>
-      expect(screen.getByText("Delete this chat?")).toBeInTheDocument(),
+      expect(screen.getByText("Delete this topic?")).toBeInTheDocument(),
     );
     fireEvent.click(screen.getByRole("button", { name: "Delete" }));
 
@@ -812,7 +1236,7 @@ describe("App layout", () => {
         within(sidebar).getByRole("button", { name: /^Second chat$/ }),
       ).toBeInTheDocument(),
     );
-    expect(screen.queryByText("Delete this chat?")).not.toBeInTheDocument();
+    expect(screen.queryByText("Delete this topic?")).not.toBeInTheDocument();
     expect(document.body.style.pointerEvents).not.toBe("none");
   }, 15_000);
 
@@ -857,7 +1281,7 @@ describe("App layout", () => {
       ).toBeInTheDocument(),
     );
 
-    fireEvent.pointerDown(screen.getByLabelText(/First chat.*会话操作/), {
+    fireEvent.pointerDown(screen.getByLabelText(/First chat.*话题操作/), {
       button: 0,
     });
     fireEvent.click(await screen.findByRole("menuitem", { name: "删除" }));
@@ -867,7 +1291,7 @@ describe("App layout", () => {
     );
     expect(getSessionAutomationsSpy).toHaveBeenCalledWith("websocket:chat-a");
     expect(
-      screen.getByText("这个对话有关联的自动任务。删除对话也会删除这些自动任务。"),
+      screen.getByText("这个话题有关联的自动任务。删除话题也会删除这些自动任务。"),
     ).toBeInTheDocument();
     expect(
       screen.queryByText("This chat has scheduled automations. Deleting it will also delete them."),
@@ -925,7 +1349,7 @@ describe("App layout", () => {
     );
 
     fireEvent.pointerDown(
-      within(mobileSidebar).getByLabelText("Chat actions for Existing chat"),
+      within(mobileSidebar).getByLabelText("Topic actions for Existing chat"),
       { button: 0 },
     );
 
@@ -936,7 +1360,7 @@ describe("App layout", () => {
 
     fireEvent.click(deleteItem);
     await waitFor(() =>
-      expect(screen.getByText("Delete this chat?")).toBeInTheDocument(),
+      expect(screen.getByText("Delete this topic?")).toBeInTheDocument(),
     );
   }, 15_000);
 
@@ -982,13 +1406,6 @@ describe("App layout", () => {
         if (href === "/api/webui/sidebar-state") {
           return { ok: true, json: async () => initialState };
         }
-        if (href.startsWith("/api/webui/sidebar-state/update?")) {
-          const encoded = new URLSearchParams(href.split("?", 2)[1]).get("state");
-          return {
-            ok: true,
-            json: async () => JSON.parse(encoded ?? "{}"),
-          };
-        }
         return { ok: false, status: 404 };
       }),
     );
@@ -1008,12 +1425,11 @@ describe("App layout", () => {
       expect(within(sidebar).getByText("Archived")).toBeInTheDocument(),
     );
     expect(within(sidebar).getByRole("button", { name: /^First chat$/ })).toBeInTheDocument();
-    const updateUrl = vi.mocked(fetch).mock.calls
-      .map(([url]) => String(url))
-      .find((url) => url.startsWith("/api/webui/sidebar-state/update?"));
-    expect(updateUrl).toBeTruthy();
-    const encoded = new URLSearchParams(updateUrl?.split("?", 2)[1]).get("state");
-    expect(JSON.parse(encoded ?? "{}").view.show_archived).toBe(true);
+    expect(setSidebarStateSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        view: expect.objectContaining({ show_archived: true }),
+      }),
+    );
 
     expect(within(sidebar).queryByRole("button", { name: "View" })).not.toBeInTheDocument();
   });
@@ -1079,16 +1495,16 @@ describe("App layout", () => {
     await waitFor(() => expect(connectSpy).toHaveBeenCalled());
     const sidebar = screen.getByRole("navigation", { name: "Sidebar navigation" });
     await waitFor(() =>
-      expect(within(sidebar).getByText("Chats")).toBeInTheDocument(),
+      expect(within(sidebar).getByText("Topics")).toBeInTheDocument(),
     );
-    const group = within(sidebar).getByText("Chats").closest("section");
+    const group = within(sidebar).getByText("Topics").closest("section");
     expect(group).toBeTruthy();
     const labels = within(group as HTMLElement)
       .getAllByRole("button")
       .map((button) => button.textContent?.trim())
       .filter(Boolean);
 
-    expect(labels).toEqual(["Alpha plan", "New chat", "Zulu work"]);
+    expect(labels).toEqual(["Alpha plan", "New topic", "Zulu work"]);
   });
 
   it("shows running and completed session indicators in the sidebar", async () => {
@@ -1306,6 +1722,7 @@ describe("App layout", () => {
   });
 
   it("opens the settings view from the sidebar footer", async () => {
+    const user = userEvent.setup();
     mockSessions = [
       {
         key: "websocket:chat-a",
@@ -1320,6 +1737,18 @@ describe("App layout", () => {
       "fetch",
       vi.fn(async (input: RequestInfo | URL) => {
         const href = String(input);
+        if (href === "/api/settings/api-service") {
+          return jsonResponse({
+            installed: false,
+            running: false,
+            managed: false,
+            host: "127.0.0.1",
+            port: 8900,
+            timeout: 120,
+            endpoint: "http://127.0.0.1:8900/v1",
+            command: "nanobot serve",
+          });
+        }
         if (href === "/api/settings/provider-models?provider=openai") {
           return jsonResponse({
             provider: "openai",
@@ -1344,24 +1773,23 @@ describe("App layout", () => {
                 provider: "auto",
                 resolved_provider: "openai",
                 has_api_key: true,
-                model_preset: "default",
+                model_preset: "primary",
                 max_tokens: 8192,
                 context_window_tokens: 65536,
                 temperature: 0.1,
                 reasoning_effort: null,
                 timezone: "UTC",
-                bot_name: "nanobot",
-                bot_icon: "nb",
                 tool_hint_max_length: 40,
               },
               model_presets: [
                 {
-                  name: "default",
-                  label: "Default",
+                  name: "primary",
+                  label: "Primary",
                   active: true,
-                  is_default: true,
+                  is_default: false,
                   model: "openai/gpt-4o",
                   provider: "auto",
+                  resolved_provider: "openai",
                   max_tokens: 8192,
                   context_window_tokens: 65536,
                   temperature: 0.1,
@@ -1380,6 +1808,8 @@ describe("App layout", () => {
                   reasoning_effort: "high",
                 },
               ],
+              model_call_order: ["primary", "deep"],
+              model_call_order_editable: true,
               providers: [
                 {
                   name: "openai",
@@ -1527,6 +1957,10 @@ describe("App layout", () => {
       }),
     );
 
+    localStorage.setItem(
+      "nanobot-webui.settings-preferences",
+      JSON.stringify({ brandLogos: true }),
+    );
     render(<App />);
 
     await waitFor(() => expect(connectSpy).toHaveBeenCalled());
@@ -1536,7 +1970,10 @@ describe("App layout", () => {
     expect(searchButton.compareDocumentPosition(appsButton) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     fireEvent.click(within(sidebar).getByRole("button", { name: "Settings" }));
 
-    expect(await screen.findByRole("heading", { name: "Overview" })).toBeInTheDocument();
+    expect(
+      await screen.findByRole("navigation", { name: "Settings sections" }),
+    ).toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "Overview" })).not.toBeInTheDocument();
     expect(document.title).toBe("Settings · nanobot");
     expect(screen.getByTestId("overview-logo-openai")).toBeInTheDocument();
     expect(screen.getByTestId("overview-logo-brave")).toBeInTheDocument();
@@ -1545,8 +1982,8 @@ describe("App layout", () => {
     expect(screen.queryByTestId("overview-logo-nanobot-workspace")).not.toBeInTheDocument();
     expect(screen.queryByRole("navigation", { name: "Sidebar navigation" })).not.toBeInTheDocument();
     const settingsNav = screen.getByRole("navigation", { name: "Settings sections" });
-    expect(settingsNav.className).toContain("overflow-x-auto");
-    expect(settingsNav.className).not.toContain("grid-cols-2");
+    expect(settingsNav.className).not.toContain("overflow-x-auto");
+    expect(within(settingsNav).getByRole("button", { name: "Settings: Overview" })).toBeInTheDocument();
     expect(within(settingsNav).getByRole("button", { name: "Overview" })).toHaveAttribute(
       "aria-current",
       "page",
@@ -1554,81 +1991,113 @@ describe("App layout", () => {
     expect(within(settingsNav).getByRole("button", { name: "Models" })).toBeInTheDocument();
     expect(within(settingsNav).queryByRole("button", { name: "Providers" })).not.toBeInTheDocument();
     expect(within(settingsNav).getByRole("button", { name: "Image" })).toBeInTheDocument();
+    expect(within(settingsNav).queryByRole("button", { name: "Files" })).not.toBeInTheDocument();
     expect(within(settingsNav).getByRole("button", { name: "Web" })).toBeInTheDocument();
     expect(within(settingsNav).queryByRole("button", { name: "Apps" })).not.toBeInTheDocument();
     expect(within(settingsNav).getByRole("button", { name: "Security" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Sign out" })).toBeInTheDocument();
-    fireEvent.click(within(settingsNav).getByRole("button", { name: "Appearance" }));
+    fireEvent.pointerDown(within(settingsNav).getByRole("button", { name: "Settings: Overview" }));
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Appearance" }));
     expect(screen.getByText("Brand logos")).toBeInTheDocument();
     expect(screen.getByRole("switch", { name: "Brand logos" })).toBeInTheDocument();
-    fireEvent.click(within(settingsNav).getByRole("button", { name: "Models" }));
+    expect(
+      screen.queryByText("Switch between light and dark appearance."),
+    ).not.toBeInTheDocument();
+    expect(screen.queryByText("Choose the language used by the WebUI.")).not.toBeInTheDocument();
+    expect(screen.queryByText("Stored only in this browser.")).not.toBeInTheDocument();
+    expect(within(settingsNav).getByRole("button", { name: "Settings: Appearance" })).toBeInTheDocument();
+    fireEvent.pointerDown(within(settingsNav).getByRole("button", { name: "Settings: Appearance" }));
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Models" }));
     expect(screen.queryByText("AI")).not.toBeInTheDocument();
-    expect(screen.getByText("Current configuration")).toBeInTheDocument();
-    expect(screen.queryByText("Presets")).not.toBeInTheDocument();
-    fireEvent.pointerDown(screen.getByRole("button", { name: "Current configuration" }));
-    fireEvent.click(screen.getByRole("menuitem", { name: "Add configuration" }));
-    const modelDialog = await screen.findByRole("dialog", { name: "New model configuration" });
-    expect(within(modelDialog).getByText("Save a provider and model as a one-click option.")).toBeInTheDocument();
-    fireEvent.change(within(modelDialog).getByPlaceholderText("Fast writing"), {
+    expect(screen.getByText("Model presets")).toBeInTheDocument();
+    expect(screen.queryByText("Model call order")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "New model preset" }));
+    expect(screen.queryByRole("dialog", { name: "New model preset" })).not.toBeInTheDocument();
+    fireEvent.change(screen.getByPlaceholderText("Fast writing"), {
       target: { value: "Fast writing" },
     });
-    fireEvent.change(within(modelDialog).getByPlaceholderText("openai/gpt-4.1"), {
-      target: { value: "openai/gpt-4.1-mini" },
-    });
-    expect(within(modelDialog).getByRole("button", { name: /OpenAI/ })).toBeInTheDocument();
-    expect(within(modelDialog).getByRole("button", { name: "Save" })).toBeEnabled();
-    fireEvent.click(within(modelDialog).getByRole("button", { name: "Cancel" }));
+    expect(
+      screen
+        .getAllByRole("button", { name: /OpenAI/ })
+        .some((button) => button.getAttribute("aria-haspopup") === "menu"),
+    ).toBe(true);
+    await user.click(screen.getByRole("button", { name: "Select model" }));
+    await user.click(await screen.findByRole("option", { name: /openai\/gpt-4o-mini/ }));
+    expect(screen.getByRole("button", { name: "Save preset" })).toBeEnabled();
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(screen.queryByText("Up to date.")).not.toBeInTheDocument();
+    fireEvent.click(
+      within(screen.getByTestId("model-call-order-row-primary")).getAllByRole("button")[0],
+    );
     fireEvent.pointerDown(screen.getByRole("button", { name: /Auto/ }));
     expect(screen.getAllByTestId("provider-picker-logo-openai").length).toBeGreaterThan(0);
     fireEvent.click(screen.getByRole("menuitem", { name: /Auto/ }));
-    const openModelPicker = () => {
+    const openModelPicker = async () => {
       const modelButtons = screen.getAllByRole("button", { name: /openai\/gpt-4o/ });
-      fireEvent.pointerDown(modelButtons[modelButtons.length - 1]);
+      await user.click(modelButtons[modelButtons.length - 1]);
     };
-    openModelPicker();
-    await screen.findByText("openai/gpt-4o-mini");
-    fireEvent.click(screen.getAllByText("openai/gpt-4o-mini")[0]);
-    expect(screen.getByText("Unsaved changes.").parentElement?.className).toContain(
-      "text-blue-600",
-    );
-    const updatedModelButtons = screen.getAllByRole("button", { name: /openai\/gpt-4o-mini/ });
-    fireEvent.pointerDown(updatedModelButtons[updatedModelButtons.length - 1]);
-    await screen.findByText("openai/gpt-4o");
-    fireEvent.click(screen.getAllByText("openai/gpt-4o")[0]);
-    expect(screen.getByText("OpenRouter")).toBeInTheDocument();
-    expect(screen.getByText("Ant Ling")).toBeInTheDocument();
+    await openModelPicker();
+    await user.click(await screen.findByRole("option", { name: /openai\/gpt-4o-mini/ }));
+    expect(screen.queryByText("Unsaved changes.")).not.toBeInTheDocument();
+    expect(screen.getByText("Model providers")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Add your own model provider" })).toBeInTheDocument();
+    expect(screen.queryByText("OpenRouter")).not.toBeInTheDocument();
+    expect(screen.queryByText("Ant Ling")).not.toBeInTheDocument();
+    expect(
+      screen.queryByText(
+        "Bring your own provider keys. Nanobot reads these values from the current config and only configured providers can be used in model presets.",
+      ),
+    ).not.toBeInTheDocument();
+    expect(screen.queryByText("azure_openai")).not.toBeInTheDocument();
     expect(screen.getByTestId("provider-logo-openai")).toBeInTheDocument();
-    expect(screen.getByText(/Product names, logos, and brands/)).toBeInTheDocument();
-    expect(screen.getAllByText("Not configured").length).toBeGreaterThan(0);
-    const clickProviderRow = (label: string) => {
-      const providerLabel = screen
-        .getAllByText(label)
+    expect(screen.queryByText(/Product names, logos, and brands/)).not.toBeInTheDocument();
+    expect(screen.queryByText("Not configured")).not.toBeInTheDocument();
+    const clickProviderRow = async (label: string) => {
+      const providerLabel = (await screen.findAllByText(label))
         .find((element) => element.className.includes("font-semibold"));
       expect(providerLabel).toBeTruthy();
       fireEvent.click(providerLabel!);
     };
-    clickProviderRow("OpenAI");
+    const chooseProvider = async (label: string) => {
+      fireEvent.pointerDown(
+        screen.getByRole("button", { name: "Add your own model provider" }),
+      );
+      fireEvent.click(await screen.findByRole("menuitem", { name: label }));
+    };
+    await clickProviderRow("OpenAI");
     fireEvent.click(screen.getByRole("button", { name: "Edit" }));
     fireEvent.change(screen.getByPlaceholderText("Leave blank to keep the current key"), {
       target: { value: "unsaved-openai-key" },
     });
-    clickProviderRow("OpenRouter");
-    clickProviderRow("OpenAI");
+    await clickProviderRow("OpenAI");
+    await chooseProvider("OpenRouter");
+    await clickProviderRow("OpenRouter");
+    await clickProviderRow("OpenAI");
     expect(screen.getByText("open••••-key")).toBeInTheDocument();
     expect(screen.queryByDisplayValue("unsaved-openai-key")).not.toBeInTheDocument();
-    clickProviderRow("Ant Ling");
+    await clickProviderRow("OpenAI");
+    await chooseProvider("Ant Ling");
     expect(screen.getByDisplayValue("https://api.ant-ling.com/v1")).toBeInTheDocument();
-    clickProviderRow("Atomic Chat");
+    await clickProviderRow("Ant Ling");
+    await chooseProvider("Atomic Chat");
     expect(screen.getByDisplayValue("http://localhost:1337/v1")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Save provider" })).toBeEnabled();
 
     fireEvent.click(within(settingsNav).getByRole("button", { name: "Image" }));
-    expect(screen.getByRole("heading", { name: "Image" })).toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "Image" })).not.toBeInTheDocument();
     expect(screen.getByRole("switch", { name: "Image generation" })).toBeInTheDocument();
     expect(screen.getByText("Provider status")).toBeInTheDocument();
-    expect(screen.getByDisplayValue("openai/gpt-5.4-image-2")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "openai/gpt-5.4-image-2" })).toBeInTheDocument();
     expect(screen.getByText("Save directory")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Save" })).toBeDisabled();
+    expect(
+      screen.queryByText(
+        "Expose generate_image in chats when a configured image provider is available.",
+      ),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByText("Choose a model supported by the selected image provider."),
+    ).not.toBeInTheDocument();
 
     fireEvent.click(within(settingsNav).getByRole("button", { name: "Web" }));
     expect(screen.getByText("Search provider")).toBeInTheDocument();
@@ -1636,6 +2105,12 @@ describe("App layout", () => {
     expect(screen.getByRole("button", { name: /Brave Search/ })).toBeInTheDocument();
     expect(screen.getByTestId("provider-picker-logo-brave")).toBeInTheDocument();
     expect(screen.getByText("BSAo••••ew20")).toBeInTheDocument();
+    expect(
+      screen.queryByText("Choose the backend used by the web search tool."),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByText("Results returned by each web_search call."),
+    ).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Edit" }));
     fireEvent.change(screen.getByPlaceholderText("Leave blank to keep the current key"), {
       target: { value: "unsaved-brave-key" },
@@ -1648,21 +2123,30 @@ describe("App layout", () => {
     expect(screen.queryByDisplayValue("unsaved-brave-key")).not.toBeInTheDocument();
 
     fireEvent.click(within(settingsNav).getByRole("button", { name: "System" }));
-    expect(screen.getByText("Bot name")).toBeInTheDocument();
+    expect(screen.queryByText("Regional")).not.toBeInTheDocument();
+    expect(screen.getByText("Timezone")).toBeInTheDocument();
+    expect(
+      screen.queryByText("Used for schedules and time-aware replies."),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByText("Restart nanobot to apply runtime changes."),
+    ).not.toBeInTheDocument();
+    expect(screen.queryByText("Bot name")).not.toBeInTheDocument();
+    expect(screen.queryByText("Bot icon")).not.toBeInTheDocument();
     expect(screen.queryByText("Tool hint length")).not.toBeInTheDocument();
     expect(screen.queryByText("Heartbeat")).not.toBeInTheDocument();
     expect(screen.queryByText("Dream")).not.toBeInTheDocument();
     expect(screen.queryByText("Unified session")).not.toBeInTheDocument();
     expect(screen.getByText("Default workspace")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Save" })).toBeDisabled();
-    fireEvent.pointerDown(screen.getByRole("button", { name: "UTC" }));
-    expect(screen.getByPlaceholderText("Search timezone")).toBeInTheDocument();
-    fireEvent.change(screen.getByPlaceholderText("Search timezone"), {
-      target: { value: "Shanghai" },
-    });
-    fireEvent.click(screen.getByRole("menuitem", { name: /Asia\/Shanghai/ }));
-    expect(screen.getByRole("button", { name: "Asia/Shanghai" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Save" })).toBeEnabled();
+    expect(screen.getByText("UTC")).toBeInTheDocument();
+    expect(screen.queryByPlaceholderText("Search timezone")).not.toBeInTheDocument();
+    expect(screen.queryByRole("listbox", { name: "Select timezone" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "UTC" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Save" })).not.toBeInTheDocument();
+    expect(
+      screen.queryByText("Connect SDKs and agents through a local /v1 endpoint."),
+    ).not.toBeInTheDocument();
+    expect(screen.queryByText("The API uses this local port.")).not.toBeInTheDocument();
   });
 
   it("restores the settings section from the URL hash after a page reload", async () => {
@@ -1676,6 +2160,54 @@ describe("App layout", () => {
     expect(window.location.hash).toBe("#/settings?section=voice");
   });
 
+  it("keeps the backend timezone without writing settings on mount", async () => {
+    const initialSettings = baseSettingsPayload();
+    mockFetchRoutes({
+      "/api/settings": initialSettings,
+    });
+    const fetchMock = vi.mocked(fetch);
+    window.history.replaceState(null, "", "/#/settings?section=runtime");
+
+    render(<App />);
+
+    expect(await screen.findByText("UTC")).toBeInTheDocument();
+    expect(
+      fetchMock.mock.calls.filter(([input]) =>
+        String(input).startsWith("/api/settings/update?timezone="),
+      ),
+    ).toHaveLength(0);
+    expect(screen.queryByRole("heading", { name: "Regional" })).not.toBeInTheDocument();
+    expect(
+      screen.queryByText("Used for schedules and time-aware replies."),
+    ).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Save" })).not.toBeInTheDocument();
+    expect(screen.queryByPlaceholderText("Search timezone")).not.toBeInTheDocument();
+    const systemSection = screen.getByRole("heading", { name: "System" }).closest("section");
+    expect(systemSection).not.toBeNull();
+    const system = within(systemSection as HTMLElement);
+    const timezoneLabel = system.getByText("Timezone");
+    const restartButton = system.getByRole("button", { name: "Restart nanobot" });
+    expect(
+      timezoneLabel.compareDocumentPosition(restartButton) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+    expect(
+      system.queryByText("Restart nanobot to apply runtime changes."),
+    ).not.toBeInTheDocument();
+  });
+
+  it("falls back to Overview for the retired Files settings URL", async () => {
+    mockFetchRoutes({ "/api/settings": baseSettingsPayload() });
+    window.history.replaceState(null, "", "/#/settings?section=files");
+
+    render(<App />);
+
+    await waitFor(() => expect(connectSpy).toHaveBeenCalled());
+    expect(
+      await screen.findByRole("navigation", { name: "Settings sections" }),
+    ).toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "Overview" })).not.toBeInTheDocument();
+  });
+
   it("updates the URL hash when switching settings sections", async () => {
     mockFetchRoutes({ "/api/settings": baseSettingsPayload() });
 
@@ -1684,26 +2216,55 @@ describe("App layout", () => {
     await waitFor(() => expect(connectSpy).toHaveBeenCalled());
     const sidebar = screen.getByRole("navigation", { name: "Sidebar navigation" });
     fireEvent.click(within(sidebar).getByRole("button", { name: "Settings" }));
-    expect(await screen.findByRole("heading", { name: "Overview" })).toBeInTheDocument();
+    expect(
+      await screen.findByRole("navigation", { name: "Settings sections" }),
+    ).toBeInTheDocument();
     expect(window.location.hash).toBe("#/settings");
 
     const settingsNav = screen.getByRole("navigation", { name: "Settings sections" });
-    fireEvent.click(within(settingsNav).getByRole("button", { name: "Models" }));
+    const overviewButton = within(settingsNav).getByRole("button", {
+      name: "Overview",
+      exact: true,
+    });
+    const modelsButton = within(settingsNav).getByRole("button", {
+      name: "Models",
+      exact: true,
+    });
+    const settingsHighlight = within(settingsNav).getByTestId(
+      "settings-selection-highlight",
+    );
 
-    expect(await screen.findByRole("heading", { name: "Models" })).toBeInTheDocument();
+    expect(overviewButton).toHaveAttribute("aria-current", "page");
+    expect(overviewButton).not.toHaveClass("bg-sidebar-accent");
+    expect(overviewButton).toHaveClass("transition-[color]");
+    expect(settingsHighlight).toHaveAttribute("data-active-id", "overview");
+
+    fireEvent.click(modelsButton);
+
+    expect(await screen.findByText("Model presets")).toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "Models" })).not.toBeInTheDocument();
     expect(window.location.hash).toBe("#/settings?section=models");
+    expect(modelsButton).toHaveAttribute("aria-current", "page");
+    expect(settingsHighlight).toHaveAttribute("data-active-id", "models");
 
-    fireEvent.click(within(settingsNav).getByRole("button", { name: "Voice" }));
+    const voiceButton = within(settingsNav).getByRole("button", {
+      name: "Voice",
+      exact: true,
+    });
+    fireEvent.click(voiceButton);
 
     expect(await screen.findByRole("heading", { name: "Voice input" })).toBeInTheDocument();
     expect(window.location.hash).toBe("#/settings?section=voice");
+    expect(voiceButton).toHaveAttribute("aria-current", "page");
+    expect(settingsHighlight).toHaveAttribute("data-active-id", "voice");
   });
 
-  it("opens Apps from the main sidebar without replacing the sidebar", async () => {
+  it("transitions between Apps and Skills without replacing the sidebar", async () => {
     mockFetchRoutes({
       "/api/settings": baseSettingsPayload(),
       "/api/settings/cli-apps": { apps: [], installed_count: 0, catalog_updated_at: "2026-04-18" },
       "/api/settings/mcp-presets": { presets: [], installed_count: 0 },
+      "/api/webui/skills": { skills: [] },
     });
 
     render(<App />);
@@ -1715,13 +2276,50 @@ describe("App layout", () => {
     fireEvent.click(appsButton);
 
     expect(await screen.findByRole("heading", { name: "Apps" })).toBeInTheDocument();
+    expect(screen.queryByText("Add tools to nanobot, then @ them in chat.")).not.toBeInTheDocument();
     expect(screen.getByRole("navigation", { name: "Sidebar navigation" })).toBeInTheDocument();
     expect(screen.queryByRole("navigation", { name: "Settings sections" })).not.toBeInTheDocument();
     expect(within(sidebar).getByRole("button", { name: "Apps" })).toHaveAttribute(
       "aria-current",
       "page",
     );
+    expect(within(sidebar).getByTestId("actions-selection-highlight")).toHaveAttribute(
+      "data-active-id",
+      "utility:apps",
+    );
+    expect(within(sidebar).queryAllByRole("button", { current: "page" })).toHaveLength(1);
+    expect(screen.getByTestId("settings-section-transition")).toHaveAttribute(
+      "data-settings-section",
+      "apps",
+    );
+    expect(screen.getByTestId("settings-section-transition")).toHaveClass(
+      "animate-in",
+      "fade-in-0",
+      "slide-in-from-bottom-1",
+      "duration-200",
+      "motion-reduce:animate-none",
+    );
     expect(document.title).toBe("Apps · nanobot");
+
+    fireEvent.click(within(sidebar).getByRole("button", { name: "Skills" }));
+
+    expect(await screen.findByRole("heading", { name: "Skills" })).toBeInTheDocument();
+    await waitFor(() => {
+      expect(screen.getByTestId("settings-section-transition")).toHaveAttribute(
+        "data-settings-section",
+        "skills",
+      );
+    });
+    expect(screen.getByRole("navigation", { name: "Sidebar navigation" })).toBeInTheDocument();
+    expect(within(sidebar).getByRole("button", { name: "Skills" })).toHaveAttribute(
+      "aria-current",
+      "page",
+    );
+    expect(within(sidebar).getByTestId("actions-selection-highlight")).toHaveAttribute(
+      "data-active-id",
+      "utility:skills",
+    );
+    expect(document.title).toBe("Skills · nanobot");
   });
 
   it("returns from settings to the blank start page when no session was active", async () => {
@@ -1762,8 +2360,6 @@ describe("App layout", () => {
                 temperature: 0.1,
                 reasoning_effort: null,
                 timezone: "UTC",
-                bot_name: "nanobot",
-                bot_icon: "nb",
                 tool_hint_max_length: 40,
               },
               model_presets: [
@@ -1858,11 +2454,13 @@ describe("App layout", () => {
 
     await waitFor(() => expect(connectSpy).toHaveBeenCalled());
     const sidebar = screen.getByRole("navigation", { name: "Sidebar navigation" });
-    fireEvent.click(within(sidebar).getByRole("button", { name: "New chat" }));
+    fireEvent.click(within(sidebar).getByRole("button", { name: "New topic" }));
     await waitFor(() => expect(document.title).toBe("nanobot"));
 
     fireEvent.click(within(sidebar).getByRole("button", { name: "Settings" }));
-    expect(await screen.findByRole("heading", { name: "Overview" })).toBeInTheDocument();
+    expect(
+      await screen.findByRole("navigation", { name: "Settings sections" }),
+    ).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Back to chat" }));
 
     await waitFor(() => expect(document.title).toBe("nanobot"));
@@ -1896,7 +2494,7 @@ describe("App layout", () => {
     const sidebar = screen.getByRole("navigation", { name: "Sidebar navigation" });
     expect(within(sidebar).getByText("Q2 roadmap")).toBeInTheDocument();
     expect(within(sidebar).getByText("Travel ideas")).toBeInTheDocument();
-    const newChatButton = within(sidebar).getByRole("button", { name: "New chat" });
+    const newChatButton = within(sidebar).getByRole("button", { name: "New topic" });
     const searchButton = within(sidebar).getByRole("button", { name: "Search" });
     expect(
       newChatButton.compareDocumentPosition(searchButton) &
@@ -2026,10 +2624,10 @@ describe("App layout", () => {
     await waitFor(() => expect(connectSpy).toHaveBeenCalled());
     const sidebar = screen.getByRole("navigation", { name: "Sidebar navigation" });
 
-    const newChatButton = within(sidebar).getByRole("button", { name: "New chat" });
+    const newChatButton = within(sidebar).getByRole("button", { name: "New topic" });
     expect(newChatButton).toHaveAttribute(
       "title",
-      "New chat (Ctrl+Shift+O)",
+      "New topic (Ctrl+Shift+O)",
     );
     expect(newChatButton).toHaveAttribute(
       "aria-keyshortcuts",
@@ -2044,9 +2642,9 @@ describe("App layout", () => {
     await waitFor(() => expect(connectSpy).toHaveBeenCalled());
     const sidebar = screen.getByRole("navigation", { name: "Sidebar navigation" });
 
-    expect(within(sidebar).getByRole("button", { name: "New chat" })).toHaveAttribute(
+    expect(within(sidebar).getByRole("button", { name: "New topic" })).toHaveAttribute(
       "title",
-      "New chat (⌘⇧O)",
+      "New topic (⌘⇧O)",
     );
   });
 
@@ -2117,9 +2715,9 @@ describe("App layout", () => {
     const sidebarAside = container.querySelector("aside.lg\\:block") as HTMLElement;
     await waitFor(() => expect(sidebarAside.style.width).toBe("56px"));
 
-    expect(screen.queryByRole("button", { name: "Start a new chat" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Start a new topic" })).not.toBeInTheDocument();
     const rail = screen.getByRole("navigation", { name: "Sidebar navigation" });
-    expect(within(rail).getByRole("button", { name: "New chat" })).toBeInTheDocument();
+    expect(within(rail).getByRole("button", { name: "New topic" })).toBeInTheDocument();
     expect(within(rail).getByRole("button", { name: "Search" })).toBeInTheDocument();
     expect(within(rail).queryByRole("button", { name: "View" })).not.toBeInTheDocument();
     expect(within(rail).queryByText("Existing chat")).not.toBeInTheDocument();
@@ -2128,10 +2726,10 @@ describe("App layout", () => {
     await waitFor(() => expect(sidebarAside.style.width).toBe("272px"));
 
     const sidebar = screen.getByRole("navigation", { name: "Sidebar navigation" });
-    fireEvent.click(within(sidebar).getByRole("button", { name: "New chat" }));
+    fireEvent.click(within(sidebar).getByRole("button", { name: "New topic" }));
     expect(createChatSpy).not.toHaveBeenCalled();
     expect(screen.getByText(HERO_GREETING_PATTERN)).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Start a new chat" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Start a new topic" })).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Toggle theme from header" })).toBeInTheDocument();
     expect(within(sidebar).getByRole("button", { name: "Settings" })).toBeInTheDocument();
 
@@ -2143,11 +2741,13 @@ describe("App layout", () => {
     vi.mocked(fetchBootstrap)
       .mockResolvedValueOnce({
         token: "tok-1",
+        api_token: "api-tok-1",
         ws_path: "/",
         expires_in: 30,
       })
       .mockResolvedValueOnce({
         token: "tok-2",
+        api_token: "api-tok-2",
         ws_path: "/",
         expires_in: 300,
       });
@@ -2168,5 +2768,55 @@ describe("App layout", () => {
     expect(fetchBootstrap).toHaveBeenCalledTimes(2);
     expect(updateUrlSpy).toHaveBeenCalledWith("ws://test?token=tok-2");
     unmount();
+  });
+
+  it("reuses an in-flight pairing poll when the page becomes visible again", async () => {
+    let resolvePairing!: (response: Response) => void;
+    const pendingPairing = new Promise<Response>((resolve) => {
+      resolvePairing = resolve;
+    });
+    const fetchMock = vi.fn((input: RequestInfo | URL) => (
+      String(input) === "/api/settings/pairing"
+        ? pendingPairing
+        : Promise.resolve({ ok: false, status: 404 } as Response)
+    ));
+    vi.stubGlobal("fetch", fetchMock);
+    const visibilityDescriptor = Object.getOwnPropertyDescriptor(document, "visibilityState");
+
+    const setVisibility = (state: DocumentVisibilityState) => {
+      Object.defineProperty(document, "visibilityState", {
+        configurable: true,
+        value: state,
+      });
+      document.dispatchEvent(new Event("visibilitychange"));
+    };
+
+    try {
+      render(<App />);
+      await waitFor(() => {
+        expect(fetchMock.mock.calls.filter(([input]) => (
+          String(input) === "/api/settings/pairing"
+        ))).toHaveLength(1);
+      });
+
+      act(() => setVisibility("hidden"));
+      act(() => setVisibility("visible"));
+
+      expect(fetchMock.mock.calls.filter(([input]) => (
+        String(input) === "/api/settings/pairing"
+      ))).toHaveLength(1);
+      await act(async () => {
+        resolvePairing(jsonResponse({ requests: [] }));
+        await pendingPairing;
+      });
+    } finally {
+      if (visibilityDescriptor) {
+        Object.defineProperty(document, "visibilityState", visibilityDescriptor);
+      } else {
+        delete (document as Document & {
+          visibilityState?: DocumentVisibilityState;
+        }).visibilityState;
+      }
+    }
   });
 });
