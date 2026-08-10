@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -399,9 +399,14 @@ describe("SettingsView Apps catalog", () => {
         dispatchEvent: vi.fn(),
       })),
     );
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(() => new Promise<Response>(() => {})),
+    );
   });
 
   afterEach(() => {
+    cleanup();
     localStorage.removeItem("nanobot-webui.settings-preferences");
     vi.useRealTimers();
     vi.unstubAllGlobals();
@@ -2137,6 +2142,57 @@ describe("SettingsView Apps catalog", () => {
     expect(reasoningEffort).toHaveValue("provider-native-mode");
   });
 
+  it("expands the model preset editor directly below the selected row", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url === "/api/settings") return jsonResponse(settingsPayload());
+        if (url === "/api/settings/cli-apps") {
+          return jsonResponse({ apps: [], installed_count: 0 });
+        }
+        if (url === "/api/settings/mcp-presets") {
+          return jsonResponse({ presets: [], installed_count: 0 });
+        }
+        return { ok: false, status: 404, json: async () => ({}) } as Response;
+      }),
+    );
+
+    renderSettingsView({ initialSection: "models" });
+
+    const row = await screen.findByTestId("model-call-order-row-primary");
+    const trigger = within(row).getAllByRole("button")[0];
+    expect(screen.queryByTestId("model-preset-editor")).not.toBeInTheDocument();
+    expect(trigger).toHaveAttribute("aria-expanded", "false");
+
+    fireEvent.click(trigger);
+
+    const editor = screen.getByTestId("model-preset-editor");
+    expect(trigger).toHaveAttribute("aria-pressed", "true");
+    expect(trigger).toHaveAttribute("aria-expanded", "true");
+    expect(trigger).toHaveAttribute("aria-controls", "model-preset-editor");
+    expect(row.parentElement).toHaveAttribute("role", "listitem");
+    expect(row.parentElement?.parentElement).toHaveAttribute("role", "list");
+    expect(row.nextElementSibling).toBe(editor);
+    expect(editor).toHaveClass(
+      "slide-in-from-top-1",
+      "lg:max-w-6xl",
+      "rounded-[18px]",
+    );
+    expect(within(editor).getByDisplayValue("Primary")).toBeInTheDocument();
+    const deleteButton = within(editor).getByRole("button", { name: "Delete" });
+    expect(deleteButton).toBeDisabled();
+    expect(deleteButton).toHaveAttribute("aria-describedby", "model-preset-delete-hint");
+    expect(
+      within(editor).getByText("Remove this preset from the call order before deleting it."),
+    ).toBeInTheDocument();
+
+    fireEvent.click(trigger);
+
+    expect(trigger).toHaveAttribute("aria-expanded", "false");
+    expect(screen.queryByTestId("model-preset-editor")).not.toBeInTheDocument();
+  });
+
   it("drags model presets to reorder and saves the model call order immediately", async () => {
     const { payload, backupPreset } = settingsPayloadWithBackup();
     const updatedPayload: SettingsPayload = {
@@ -2268,7 +2324,17 @@ describe("SettingsView Apps catalog", () => {
     renderSettingsView({ initialSection: "models", initialSettings: initialPayload });
 
     const primaryRow = screen.getByTestId("model-call-order-row-primary");
-    const firstBackupRow = screen.getAllByTestId("model-call-order-row-backup")[0];
+    const backupRows = screen.getAllByTestId("model-call-order-row-backup");
+    const firstBackupRow = backupRows[0];
+    const secondBackupRow = backupRows[1];
+    const secondBackupTrigger = within(secondBackupRow).getAllByRole("button")[0];
+    fireEvent.click(secondBackupTrigger);
+    expect(screen.getAllByTestId("model-preset-editor")).toHaveLength(1);
+    expect(secondBackupRow.nextElementSibling).toBe(
+      screen.getByTestId("model-preset-editor"),
+    );
+    fireEvent.click(secondBackupTrigger);
+
     const dataTransfer = {
       dropEffect: "move",
       effectAllowed: "move",
