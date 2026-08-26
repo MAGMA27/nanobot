@@ -561,7 +561,7 @@ class MatrixChannel(BaseChannel):
                     filesize=size_bytes,
                 )
         except Exception:
-            self.logger.error("Matrix media upload failed for %s", filename, exc_info=True)
+            self.logger.error("Matrix media upload failed for {}", filename, exc_info=True)
             return fail
 
         is_tuple_result = isinstance(cast(object, upload_result), tuple)
@@ -586,7 +586,7 @@ class MatrixChannel(BaseChannel):
         try:
             await self._send_room_content(room_id, content)
         except Exception:
-            self.logger.error("Matrix room content send failed for room_id=%s", room_id, exc_info=True)
+            self.logger.error("Matrix room content send failed for room_id={}", room_id, exc_info=True)
             return fail
         return None
 
@@ -681,7 +681,7 @@ class MatrixChannel(BaseChannel):
                     # we are editing the same message all the time, so only the first time the event id needs to be set
                     buf.event_id = cast(RoomSendResponse, response).event_id
             except Exception:
-                self.logger.error("Stream send/edit failed for chat_id=%s", chat_id, exc_info=True)
+                self.logger.error("Stream send/edit failed for chat_id={}", chat_id, exc_info=True)
                 await self._stop_typing_keepalive(chat_id, clear_typing=True)
 
 
@@ -968,6 +968,11 @@ class MatrixChannel(BaseChannel):
             meta["thread_reply_to_event_id"] = reply_to
         return meta
 
+    def _thread_session_key(self, room_id: str, event: RoomMessage) -> str | None:
+        if not (root_id := self._event_thread_root_id(event)):
+            return None
+        return f"{self.name}:{room_id}:thread:{root_id}"
+
     @staticmethod
     def _build_thread_relates_to(metadata: dict[str, Any] | None) -> dict[str, Any] | None:
         if not metadata:
@@ -1171,6 +1176,7 @@ class MatrixChannel(BaseChannel):
             await self._handle_message(
                 sender_id=event.sender, chat_id=room.room_id,
                 content=event.body, metadata=self._base_metadata(room, event),
+                session_key=self._thread_session_key(room.room_id, event),
                 is_dm=self._is_direct_room(room),
             )
         except Exception:
@@ -1209,6 +1215,7 @@ class MatrixChannel(BaseChannel):
                 content="\n".join(parts),
                 media=[attachment["path"]] if attachment else [],
                 metadata=meta,
+                session_key=self._thread_session_key(room.room_id, event),
                 is_dm=self._is_direct_room(room),
             )
         except Exception:

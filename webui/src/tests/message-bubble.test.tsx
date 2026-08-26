@@ -108,9 +108,31 @@ describe("MessageBubble", () => {
     const pill = screen.getByText("hello");
 
     expect(row).toHaveClass("ml-auto", "flex");
-    expect(pill).toHaveClass("ml-auto", "w-fit", "rounded-[18px]");
+    expect(pill).toHaveClass("ml-auto", "w-fit", "rounded-floating");
     expect(screen.getByRole("button", { name: "Copy" })).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Fork" })).not.toBeInTheDocument();
+  });
+
+  it("renders cross-session input with its public handle", () => {
+    const message: UIMessage = {
+      id: "session-message:message-1",
+      role: "user",
+      content: "Please review this.",
+      createdAt: 1_700_000_000_123,
+      sessionMessage: {
+        message_id: "message-1",
+        session: {
+          id: "handle_0123456789abcdef0123456789abcdef",
+          name: "mira-0123456789",
+        },
+      },
+    };
+
+    const { container } = render(<MessageBubble message={message} />);
+
+    expect(container.querySelector("[data-session-message]")).toBeInTheDocument();
+    expect(screen.getByText("@mira-0123456789")).toBeInTheDocument();
+    expect(screen.getByText("Please review this.")).toBeInTheDocument();
   });
 
   it("outlines temporary-chat user messages with a short dashed border", () => {
@@ -223,6 +245,7 @@ describe("MessageBubble", () => {
 
     const quote = screen.getByLabelText("Quoted context");
     expect(quote).toHaveTextContent("selected assistant excerpt");
+    expect(quote).not.toHaveAttribute("title");
     expect(screen.queryByText("Quoted context")).not.toBeInTheDocument();
     expect(screen.getByText("What about this?")).toBeInTheDocument();
 
@@ -286,7 +309,7 @@ describe("MessageBubble", () => {
     expect(command.getAttribute("style")).toContain("var(--inline-token-highlight)");
     expect(command.className).not.toMatch(/(?:^|\s)(?:bg-|border|ring|rounded)/);
     expect(command.parentElement).toHaveTextContent("/model gpt-5");
-    expect(command.parentElement).toHaveClass("rounded-[18px]", "bg-secondary/70");
+    expect(command.parentElement).toHaveClass("rounded-floating", "bg-secondary/70");
   });
 
   it("keeps unknown and invalid slash commands as plain message text", () => {
@@ -934,7 +957,7 @@ describe("MessageBubble", () => {
     const { container } = render(<MessageBubble message={message} />);
 
     const imageButton = screen.getByRole("button", { name: /view image/i });
-    expect(imageButton).toHaveClass("w-[min(100%,34rem)]", "rounded-[20px]");
+    expect(imageButton).toHaveClass("w-[min(100%,34rem)]", "rounded-panel");
     expect(imageButton).toHaveClass(
       "border",
       "border-border/60",
@@ -988,5 +1011,51 @@ describe("MessageBubble", () => {
     expect(screen.getByRole("button", { name: /view image: growth.svg/i })).toBeInTheDocument();
     expect(container.querySelector('img[src="/api/media/sig/svg"]')).toBeInTheDocument();
     expect(screen.queryByLabelText("File attachment")).not.toBeInTheDocument();
+  });
+
+  it("keeps turn usage focused on the completed reply", () => {
+    const message: UIMessage = {
+      id: "a-usage",
+      role: "assistant",
+      content: "done",
+      createdAt: Date.now(),
+      latencyMs: 18_200,
+      contextWindowTokens: 128_000,
+      usage: {
+        prompt_tokens: 12_400,
+        completion_tokens: 823,
+        cached_tokens: 9_672,
+        context_tokens: 8_100,
+        request_count: 3,
+      },
+    };
+
+    render(<MessageBubble message={message} />);
+
+    const usage = screen.getByText("12.4K in · 823 out · 78% cached · 18s");
+    expect(usage).toHaveAttribute("data-turn-usage");
+    expect(usage).not.toHaveAttribute("tabindex");
+    expect(screen.queryByRole("tooltip")).not.toBeInTheDocument();
+  });
+
+  it("marks estimated usage and omits cache when the provider did not report it", () => {
+    const message: UIMessage = {
+      id: "a-estimated-usage",
+      role: "assistant",
+      content: "done",
+      createdAt: Date.now(),
+      usage: {
+        prompt_tokens: 1_250,
+        completion_tokens: 90,
+        estimated_tokens: 1_340,
+      },
+    };
+
+    render(<MessageBubble message={message} />);
+
+    const usage = screen.getByText("~1.3K in · ~90 out");
+    expect(usage).not.toHaveTextContent("cached");
+    fireEvent.focus(usage);
+    expect(screen.getByRole("tooltip")).toHaveTextContent("Includes estimated usage");
   });
 });
